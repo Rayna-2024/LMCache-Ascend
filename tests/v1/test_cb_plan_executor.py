@@ -12,13 +12,13 @@ from __future__ import annotations
 import sys
 import threading
 
+# First Party
+import lmcache_ascend.c_ops as lmc_ops
+
 # Third Party
 import numpy as np
 import pytest
 import torch
-
-# First Party
-import lmcache_ascend.c_ops as lmc_ops
 
 requires_npu = pytest.mark.skipif(
     not (hasattr(torch, "npu") and torch.npu.is_available()),
@@ -720,3 +720,91 @@ def test_cb_plan_releases_gil_during_native_execution() -> None:
 )
 def test_cb_plan_fp8_ramp_deferred(is_neox) -> None:
     """Explicit deferred coverage, not an FP8 numerical test or a passing UT."""
+
+
+@requires_npu
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("capacity", [5, 128, 4097])
+@pytest.mark.parametrize("is_neox", [False, True])
+def test_mla_plan_relocates_rope_and_scatters_unequal_planes(
+    dtype, capacity, is_neox
+) -> None:
+    """MLA content is bit-identical; only the trailing RoPE window moves."""
+    device = torch.device("npu:0")
+    nl, latent, rope, bs, nb = 2, 512, 64, 4, 2
+    hidden = latent + rope
+    generator = torch.Generator().manual_seed(61)
+    raw = torch.randn((nl, capacity, 1, rope), generator=generator)
+    unit_cache, inv_freq = _rope_cache(rope, capacity + 12, dtype, device)
+    amplitude = 1.25
+    stored_rope = (
+        _rope_reference(raw, torch.arange(2, 2 + capacity), inv_freq, is_neox) * amplitude
+    ).to(dtype)
+    target_rope = (
+        _rope_reference(raw, torch.arange(11, 11 + capacity), inv_freq, is_neox) * amplitude
+    ).to(dtype)
+    content = torch.randn((nl, capacity, latent), generator=generator).to(dtype)
+    temp = torch.cat((content, stored_rope.flatten(2)), -1)[None].to(device)
+    caches = [
+        tuple(
+            torch.full((nb, bs, 1, width), -7, dtype=dtype, device=device)
+            for width in (latent, rope)
+        )
+        for _ in range(nl)
+    ]
+    pointers = torch.tensor(
+        [t.data_ptr() for pair in caches for t in pair],
+        dtype=torch.int64,
+        device=device,
+    )
+    mapping = torch.tensor([5, -1, 0, 7, 2], dtype=torch.int64, device=device)
+    scalar = {torch.float16: 5, torch.bfloat16: 15, torch.float32: 6}[dtype]
+    spec = lmc_ops.CBGroupSpec(
+        pointers.data_ptr(),
+        [temp.data_ptr()],
+        nl,
+        capacity,
+        hidden,
+        temp.element_size(),
+        int(lmc_ops.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS),
+        nb * bs,
+        bs,
+        rope,
+        mapping.data_ptr(),
+        mapping.numel(),
+        unit_cache.data_ptr(),
+        rope,
+        1,
+        hidden,
+        scalar,
+        is_neox,
+        latent * temp.element_size(),
+        bs * latent,
+        scalar,
+    )
+    lmc_ops.execute_cb_retrieve_plan_flat(
+        device,
+        4096,
+        [spec],
+        _empty_table(),
+        np.array([[0, 0, 2, 11]], dtype=np.int64),
+        np.array([[0, 0, 0, 4]], dtype=np.int64),
+        np.array([[0, 1, 1]], dtype=np.int64),
+    )
+    torch.npu.synchronize()
+    assert torch.equal(temp[0, ..., :latent].cpu(), content)
+    torch.testing.assert_close(
+        temp[0, ..., latent:].cpu(),
+        target_rope.flatten(2),
+        **_reference_tolerance(dtype),
+    )
+    for layer, pair in enumerate(caches):
+        expected_content = torch.full((nb * bs, latent), -7, dtype=dtype)
+        expected_rope = torch.full((nb * bs, rope), -7, dtype=dtype)
+        for token, slot in ((0, 5), (2, 0), (3, 7)):
+            expected_content[slot] = content[layer, token]
+            expected_rope[slot] = target_rope[layer, token, 0]
+        assert torch.equal(pair[0].flatten(0, 2).cpu(), expected_content)
+        torch.testing.assert_close(
+            pair[1].flatten(0, 2).cpu(), expected_rope, **_reference_tolerance(dtype)
+        )

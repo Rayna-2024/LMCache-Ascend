@@ -739,11 +739,13 @@ kvcache_ops::TokenKVTransferLayout
 prepare_token_transfer_layout(EngineKVFormat format, int32_t num_layers,
                               int32_t slot_tokens, int64_t hidden_elems,
                               int32_t element_size, int64_t page_buffer_size,
-                              int32_t block_size, int64_t block_stride_elems) {
+                              int32_t block_size, int64_t block_stride_elems,
+                              int64_t mla_latent_bytes) {
   // The device address calculation implements only these two K/V layouts.
   const bool fmt2 = format == EngineKVFormat::NL_X_NB_TWO_BS_NH_HS;
-  TORCH_CHECK(fmt2 || format == EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS,
-              "token KV transfer supports formats 2 and 16, got ",
+  const bool mla = format == EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS;
+  TORCH_CHECK(fmt2 || mla || format == EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS,
+              "token KV transfer supports formats 2, 16 and declared MLA 17, got ",
               static_cast<int>(format));
   TORCH_CHECK(num_layers > 0 && slot_tokens > 0 && hidden_elems > 0 &&
                   page_buffer_size > 0 && block_size > 0,
@@ -760,6 +762,27 @@ prepare_token_transfer_layout(EngineKVFormat format, int32_t num_layers,
                   row_bytes <= kvcache_ops::kTokenTransferUbBytes,
               "token transfer row bytes must be a multiple of 32 and at most ",
               kvcache_ops::kTokenTransferUbBytes, ", got ", row_bytes);
+  if (mla) {
+    TORCH_CHECK(mla_latent_bytes > 0 && mla_latent_bytes < row_bytes &&
+                    mla_latent_bytes % 32 == 0 &&
+                    (row_bytes - mla_latent_bytes) % 32 == 0,
+                "MLA token transfer requires aligned latent/RoPE plane widths");
+    // The MLA connector validates that BOTH receiver planes are contiguous.
+    // A reported first-plane stride must agree with that tight layout.
+    TORCH_CHECK(block_stride_elems == 0 ||
+                    checked_mul(block_stride_elems, element_size,
+                                "MLA reported stride") ==
+                        checked_mul(block_size, mla_latent_bytes,
+                                    "MLA latent stride"),
+                "MLA token transfer requires tight, unpadded cache planes");
+    checked_mul(page_buffer_size, row_bytes, "MLA cache span");
+    checked_mul(checked_mul(num_layers, slot_tokens, "MLA layer slots"),
+                row_bytes, "MLA staging bytes");
+    return {num_layers, slot_tokens, block_size, page_buffer_size,
+            row_bytes, 0, false, mla_latent_bytes};
+  }
+  TORCH_CHECK(mla_latent_bytes == 0,
+              "MLA plane widths require format 17");
   const int64_t plane_span =
       checked_mul(block_size, row_bytes, "token transfer plane span");
   const int64_t tight_stride =
@@ -781,7 +804,7 @@ prepare_token_transfer_layout(EngineKVFormat format, int32_t num_layers,
   checked_mul(checked_mul(2, num_layers, "token transfer planes"), slot_tokens,
               "token transfer maximum work");
   return {num_layers, slot_tokens, block_size, page_buffer_size,
-          row_bytes,  stride,      fmt2};
+          row_bytes,  stride,      fmt2, 0};
 }
 
 } // namespace
@@ -791,11 +814,12 @@ void multi_layer_token_kv_transfer_on_stream(
     int32_t num_tokens, TransferDirection direction, EngineKVFormat format,
     int32_t num_layers, int32_t slot_tokens, int64_t hidden_elems,
     int32_t element_size, int64_t page_buffer_size, int32_t block_size,
-    int64_t block_stride_elems, uint32_t aiv_num, aclrtStream stream) {
+    int64_t block_stride_elems, uint32_t aiv_num, aclrtStream stream,
+    int64_t mla_latent_bytes) {
   // Resolve and check the token kernel geometry at its launch entry.
   const auto layout = prepare_token_transfer_layout(
       format, num_layers, slot_tokens, hidden_elems, element_size,
-      page_buffer_size, block_size, block_stride_elems);
+      page_buffer_size, block_size, block_stride_elems, mla_latent_bytes);
   TORCH_CHECK(num_tokens >= 0 && num_tokens <= layout.slot_tokens,
               "token transfer count exceeds source capacity");
   TORCH_CHECK(direction == TransferDirection::H2D ||

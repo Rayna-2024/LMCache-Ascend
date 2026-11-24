@@ -87,7 +87,10 @@ void execute_cb_retrieve_plan(const torch::Device &device,
             mapping, scatter.n_tok, TransferDirection::H2D,
             group.engine_kv_format, group.num_layers, group.slot_tokens,
             group.hidden_elems, group.element_size, group.page_buffer_size,
-            group.block_size, group.block_stride_elems, aiv_num, stream);
+            group.block_size, group.block_stride_elems, aiv_num, stream,
+            group.engine_kv_format == EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS
+                ? group.rope_base_offset
+                : 0);
       }
     }
   }

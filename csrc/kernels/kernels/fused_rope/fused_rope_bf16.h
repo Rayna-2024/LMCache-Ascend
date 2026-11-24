@@ -120,7 +120,7 @@ __aicore__ inline void FusedRopeFP16<T>::Init(
                           blockOffset * this->kLeadingDimension);
   cosSinCacheGM.SetGlobalBuffer((__gm__ T*)cosSinCache);
   keyGM.SetGlobalBuffer((__gm__ T*)keyOut +
-                        blockOffset * this->numHeads * this->headSize);
+                        blockOffset * this->kLeadingDimension);
   numHeadsMax = this->numHeads;
 
   pipe->InitBuffer(inQQue, this->numTokensEachLoopCurrentCore * numHeadsMax *
@@ -356,7 +356,7 @@ __aicore__ inline void FusedRopeFP16<T>::Compute(uint64_t index,
   kSize = this->numHeads * this->headSize;
   uint64_t keyInOffset =
       index * this->numTokensEachLoopCurrentCore * this->kLeadingDimension;
-  uint64_t offsetK = index * this->numTokensEachLoopCurrentCore * kSize;
+  uint64_t offsetK = keyInOffset;
   uint32_t dstShape[2] = {static_cast<uint32_t>(this->numHeadsMax),
                           static_cast<uint32_t>(this->rotaryDim)};
   uint32_t dstShape4Negone[2] = {
@@ -446,7 +446,8 @@ __aicore__ inline void FusedRopeFP16<T>::Compute(uint64_t index,
 
   DataCopy(keyGM[offsetK], outQueAfterCastLocal,
            {static_cast<uint16_t>(loopN),
-            static_cast<uint16_t>(this->numHeads * headBlockLen / 2), 0, 0});
+            static_cast<uint16_t>(this->numHeads * headBlockLen / 2), 0,
+            static_cast<uint16_t>((this->kLeadingDimension - kSize) / ELE_NUM_FP16)});
   PipeBarrier<PIPE_ALL>();
 
   inQQueBeforeCast.FreeTensor(inQQueBeforeCastLocal);

@@ -160,4 +160,5 @@ void multi_layer_token_kv_transfer_on_stream(
     int32_t num_tokens, TransferDirection direction, EngineKVFormat format,
     int32_t num_layers, int32_t slot_tokens, int64_t hidden_elems,
     int32_t element_size, int64_t page_buffer_size, int32_t block_size,
-    int64_t block_stride_elems, uint32_t aiv_num, aclrtStream stream);
+    int64_t block_stride_elems, uint32_t aiv_num, aclrtStream stream,
+    int64_t mla_latent_bytes = 0);

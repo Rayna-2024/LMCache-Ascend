@@ -22,6 +22,7 @@ public:
     block_size_ = layout.block_size;
     block_stride_bytes_ = layout.block_stride_bytes;
     one_pointer_per_layer_ = layout.one_pointer_per_layer;
+    mla_latent_bytes_ = layout.mla_latent_bytes;
     page_to_lmc_ = page_to_lmc;
     pipe->InitBuffer(queue_, 1, hidden_bytes_);
   }
@@ -50,20 +51,28 @@ public:
           one_pointer_per_layer_
               ? static_cast<int64_t>(plane) * block_size_ * hidden_bytes_
               : 0;
-      auto* engine_ptr = plane_base + block * block_stride_bytes_ +
-                         plane_offset + in_block * hidden_bytes_;
+      const int64_t copy_bytes = mla_latent_bytes_ > 0
+                                     ? (plane == 0 ? mla_latent_bytes_
+                                                   : hidden_bytes_ - mla_latent_bytes_)
+                                     : hidden_bytes_;
+      const int64_t engine_stride = mla_latent_bytes_ > 0
+                                        ? block_size_ * copy_bytes
+                                        : block_stride_bytes_;
+      auto* engine_ptr = plane_base + block * engine_stride +
+                         plane_offset + in_block * copy_bytes;
 
-      const int64_t temp_offset =
-          ((static_cast<int64_t>(plane) * num_layers_ + layer) * slot_tokens_ +
-           token) *
-          hidden_bytes_;
+      const int64_t temp_offset = mla_latent_bytes_ > 0
+          ? (static_cast<int64_t>(layer) * slot_tokens_ + token) * hidden_bytes_
+                + (plane == 0 ? 0 : mla_latent_bytes_)
+          : ((static_cast<int64_t>(plane) * num_layers_ + layer) * slot_tokens_ +
+             token) * hidden_bytes_;
       AscendC::GlobalTensor<uint8_t> temp_row;
       AscendC::GlobalTensor<uint8_t> engine_row;
-      temp_row.SetGlobalBuffer(lmc_buffer_ + temp_offset, hidden_bytes_);
-      engine_row.SetGlobalBuffer(engine_ptr, hidden_bytes_);
+      temp_row.SetGlobalBuffer(lmc_buffer_ + temp_offset, copy_bytes);
+      engine_row.SetGlobalBuffer(engine_ptr, copy_bytes);
 
       auto ub = queue_.AllocTensor<uint8_t>();
-      AscendC::DataCopyExtParams copy{1, static_cast<uint32_t>(hidden_bytes_),
+      AscendC::DataCopyExtParams copy{1, static_cast<uint32_t>(copy_bytes),
                                       0u, 0u, 0u};
       AscendC::DataCopyPadExtParams<uint8_t> pad{false, 0u, 0u, 0u};
       AscendC::DataCopyPad(ub, page_to_lmc_ ? engine_row : temp_row, copy, pad);
@@ -83,7 +92,7 @@ private:
       queue_;
   bool one_pointer_per_layer_, page_to_lmc_;
   int32_t num_layers_, slot_tokens_, num_tokens_, block_size_;
-  int64_t hidden_bytes_, page_buffer_size_, block_stride_bytes_;
+  int64_t hidden_bytes_, page_buffer_size_, block_stride_bytes_, mla_latent_bytes_;
 };
 
 } // namespace
@@ -92,10 +101,11 @@ extern "C" __global__ __aicore__ void multi_layer_token_kv_transfer_kernel(
     GM_ADDR pointers, GM_ADDR lmc_buffer, GM_ADDR slot_mapping,
     int32_t num_tokens, int32_t num_layers, int32_t slot_tokens,
     int32_t block_size, int64_t page_buffer_size, int64_t row_bytes,
-    int64_t block_stride_bytes, bool one_pointer_per_layer, bool page_to_lmc) {
+    int64_t block_stride_bytes, bool one_pointer_per_layer, bool page_to_lmc,
+    int64_t mla_latent_bytes) {
   const kvcache_ops::TokenKVTransferLayout layout{
       num_layers, slot_tokens,        block_size,           page_buffer_size,
-      row_bytes,  block_stride_bytes, one_pointer_per_layer};
+      row_bytes,  block_stride_bytes, one_pointer_per_layer, mla_latent_bytes};
   AscendC::TPipe pipe;
   MultiLayerTokenKVTransfer op;
   op.Init(pointers, lmc_buffer, slot_mapping, num_tokens, layout, page_to_lmc,
@@ -113,7 +123,7 @@ void multi_layer_token_kv_transfer_kernel(
       paged_kv_ptrs, lmc_buffer, slot_mapping, num_tokens, layout.num_layers,
       layout.slot_tokens, layout.block_size, layout.page_buffer_size,
       layout.row_bytes, layout.block_stride_bytes, layout.one_pointer_per_layer,
-      page_to_lmc);
+      page_to_lmc, layout.mla_latent_bytes);
 }
 
 } // namespace kvcache_ops

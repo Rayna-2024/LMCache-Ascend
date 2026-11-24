@@ -30,14 +30,17 @@ class SelectiveConfig:
     check_layer: int = 1
     selection_metric: Literal["k", "v"] = "k"
     refresh_check_layer: bool = False
+    debug_selected_positions: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.debug_selected_positions, bool):
+            raise ValueError("debug_selected_positions must be a bool")
         if self.selection_metric not in ("k", "v"):
             raise ValueError("selection_metric must be k or v")
         if not isinstance(self.refresh_check_layer, bool):
             raise ValueError("refresh_check_layer must be a bool")
-        if not math.isfinite(self.ratio) or not 0 < self.ratio <= 1:
-            raise ValueError("selective ratio must be finite and in (0, 1]")
+        if not math.isfinite(self.ratio) or not 0 <= self.ratio <= 1:
+            raise ValueError("selective ratio must be finite and in [0, 1]")
         if not isinstance(self.check_layer, int) or self.check_layer < 1:
             raise ValueError("check_layer must be an integer >= 1")
 
@@ -67,6 +70,10 @@ def select_positions(
     if hit_positions.numel() == 0:
         # All TP ranks agree on the empty hit set before entering the executor.
         return torch.arange(fresh_k.shape[0], device=fresh_k.device)
+    keep = torch.ones(fresh_k.shape[0], dtype=torch.bool, device=fresh_k.device)
+    keep[hit_positions] = False
+    if ratio == 0:
+        return torch.where(keep)[0]
     scores = torch.sum(
         (
             fresh_k[hit_positions].to(torch.float32)
@@ -79,8 +86,6 @@ def select_positions(
     count = min(hit_positions.numel(), max(1, int(hit_positions.numel() * ratio)))
     chosen = torch.topk(scores, k=count).indices
     chosen = broadcast(chosen)
-    keep = torch.ones(fresh_k.shape[0], dtype=torch.bool, device=fresh_k.device)
-    keep[hit_positions] = False
     keep[hit_positions[chosen]] = True
     return torch.where(keep)[0]
 
@@ -151,6 +156,7 @@ def selective_prefill(
     broadcast: TensorOp = identity,
     transfer: KVTransfer = npu_kv_transfer,
     computed_prefix_tokens: int = 0,
+    output_tail_tokens: int = 0,
 ) -> dict[str, Any]:
     """Refresh Qwen3 paged KV through len(token_ids), without producing logits.
 
@@ -167,6 +173,8 @@ def selective_prefill(
     claim. Its KV is read unchanged at every layer and never recomputed/written.
 
     Returns counts and selected absolute positions for auditable experiments.
+    When requested, the terminal suffix also returns normalized hidden states
+    for the runner. Cache hit ranges must end before that suffix.
     Unsupported layers/layouts raise ValueError; execution errors propagate,
     since silently continuing could expose partially updated KV.
     """
@@ -178,10 +186,13 @@ def selective_prefill(
         raise ValueError("selective prefill requires nonempty input")
     if not 0 <= computed_prefix_tokens < length:
         raise ValueError("computed prefix must be inside the input")
+    if not 0 <= output_tail_tokens <= length - computed_prefix_tokens:
+        raise ValueError("output tail must follow the computed prefix")
+    coverage_end = length - output_tail_tokens
     previous_end = computed_prefix_tokens
     for start, end in hit_ranges:
-        if not previous_end <= start < end <= length:
-            raise ValueError("hit ranges must be sorted, disjoint and inside input")
+        if not previous_end <= start < end <= coverage_end:
+            raise ValueError("hit ranges must be sorted, disjoint and before the output tail")
         previous_end = end
 
     # Validate every layer before modifying any KV. Packed/NZ/HND layouts need
@@ -319,11 +330,10 @@ def selective_prefill(
         hidden, residual = layer.post_attention_layernorm(hidden, residual)
         hidden = layer.mlp(hidden)
         layer_query_counts.append(positions.numel())
-    # This PoC synchronizes once for observability; logs must distinguish actual
-    # retained cache tokens from the original lookup's apparent hit coverage.
-    selected_list = selected.cpu().tolist()
+    # Shape metadata gives counts without a device-to-host synchronization.
+    selected_count = selected.numel()
     mandatory = length - computed_prefix_tokens - hits.numel()
-    return {
+    stats = {
         "computed_end": length,
         "check_layer": config.check_layer,
         "recompute_ratio": config.ratio,
@@ -331,10 +341,17 @@ def selective_prefill(
         "refresh_check_layer": config.refresh_check_layer,
         "matched_tokens": hits.numel(),
         "mandatory_tokens": mandatory,
-        "selected_hit_tokens": len(selected_list) - mandatory,
-        "retained_hit_tokens": length - computed_prefix_tokens - len(selected_list),
+        "selected_hit_tokens": selected_count - mandatory,
+        "retained_hit_tokens": length - computed_prefix_tokens - selected_count,
         "retained_prefix_tokens": computed_prefix_tokens,
-        "selected_positions": selected_list,
         "layer_query_counts": layer_query_counts,
         "layer_qkv_counts": layer_qkv_counts,
     }
+    if config.debug_selected_positions:
+        stats["selected_positions"] = selected.cpu().tolist()
+    if output_tail_tokens:
+        # Sorted mandatory misses keep the terminal suffix at the end.
+        stats["tail_hidden_states"], _ = model.model.norm(
+            hidden[-output_tail_tokens:], residual[-output_tail_tokens:]
+        )
+    return stats

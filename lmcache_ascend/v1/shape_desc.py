@@ -79,7 +79,14 @@ def install_plane_geometry_fill() -> None:
     """
     # Third Party
     import lmcache.lmcache_native as lmcache_native
-    import lmcache.v1.common.utils as common_utils
+
+    try:
+        import lmcache.v1.common.utils as common_utils
+    except ModuleNotFoundError as exc:
+        if exc.name != "lmcache.v1.common.utils":
+            raise
+        # Older LMCache releases expose the same factory at this path.
+        import lmcache.v1.gpu_connector.utils as common_utils
 
     original = common_utils.make_page_buffer_shape_desc
     plane_tuple_fmts = (

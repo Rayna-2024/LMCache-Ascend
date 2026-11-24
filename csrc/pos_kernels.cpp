@@ -222,8 +222,9 @@ void rotary_embedding_k_fused_range_on_stream(
               "CacheBlend re-RoPE positions must be non-negative");
   TORCH_CHECK(slot_tokens > 0 && num_layers > 0,
               "CacheBlend re-RoPE geometry must be positive");
-  TORCH_CHECK(head_size > 0 && head_stride == head_size,
-              "P1 CacheBlend re-RoPE requires a dense K head stride");
+  TORCH_CHECK(head_size > 0 && head_stride >= head_size &&
+                  (head_stride == head_size || num_kv_heads == 1),
+              "CacheBlend re-RoPE supports dense heads or one strided MLA head");
   TORCH_CHECK(num_kv_heads > 0 && rot_dim > 0 && rot_dim <= head_size &&
                   rot_dim % 2 == 0,
               "Invalid CacheBlend re-RoPE head geometry");
@@ -239,6 +240,9 @@ void rotary_embedding_k_fused_range_on_stream(
   const int64_t element_size = scalar_type == at::kFloat ? 4 : 2;
   // DataCopy block lengths and head gaps are computed in 32-byte units;
   // the current kernel has no tail path for unaligned heads or cos/sin halves.
+  TORCH_CHECK(head_stride * element_size % 32 == 0 &&
+                  (head_stride - head_size) * element_size / 32 <= 65535,
+              "re-RoPE row stride must be aligned and fit the copy descriptor");
   TORCH_CHECK(head_size * element_size % 32 == 0,
               "re-RoPE head bytes must be 32-byte aligned");
   TORCH_CHECK((rot_dim / 2) * element_size % 32 == 0,
@@ -251,7 +255,7 @@ void rotary_embedding_k_fused_range_on_stream(
   const uint64_t leading = static_cast<uint64_t>(num_kv_heads) * head_stride;
   params.numTokens = num_tokens;
   params.kLeadingDimension = leading;
-  params.numHeads = leading / params.headSize;
+  params.numHeads = static_cast<uint64_t>(num_kv_heads);
   params.tilingKey = tiling_key;
   ComputeTilingGeometry(params);
   TORCH_CHECK(params.numHeads == static_cast<uint64_t>(num_kv_heads),

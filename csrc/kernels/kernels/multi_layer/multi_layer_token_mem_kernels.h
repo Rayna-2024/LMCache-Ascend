@@ -20,6 +20,9 @@ struct TokenKVTransferLayout {
   int64_t row_bytes;
   int64_t block_stride_bytes;
   bool one_pointer_per_layer;
+  // Format 17 packs [latent | rope] in LMC, but has two tight engine planes.
+  // Zero keeps the ordinary equal-width K/V layout.
+  int64_t mla_latent_bytes;
 };
 
 // One launch covers all layers, K/V planes and valid tokens. Mapping is int64;

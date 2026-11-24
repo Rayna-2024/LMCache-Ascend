@@ -47,6 +47,7 @@ Its `kv_connector_extra_config` accepts:
 | Key | Default | Effect |
 | --- | --- | --- |
 | `lmcache.mp.blend_selection_metric` | `"k"` | Rank cached tokens by squared FP32 K deviation; `"v"` ranks by V deviation, matching the author's public selection metric. |
+| `lmcache.mp.blend_debug_selected_positions` | `false` | If true, include the complete `selected_positions` list in selective-prefill logs for Qwen3 and the experimental MLA path. This copies positions to CPU and can synchronize device execution. By default, only counts are recorded using tensor shape metadata. |
 | `lmcache.mp.blend_refresh_check_layer` | `false` | If true, keep all freshly projected KV at the check layer; later layers still update only selected positions. |
 
 These controls allow separate ablations of token selection and check-layer
